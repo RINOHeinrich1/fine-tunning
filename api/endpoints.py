@@ -3,7 +3,7 @@ from .schemas import QuestionRequest, FeedbackRequest
 from model.embedder import load_model
 from model.fine_tuning import fine_tune_until_margin_respected
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, VectorParams,ScrollRequest 
+from qdrant_client.models import PointStruct, VectorParams,ScrollRequest
 from model.document_parser import extract_text
 from model.embedding import get_embedding, chunk_text_optimale,get_latest_model_path
 import numpy as np
@@ -14,8 +14,8 @@ from pydantic import BaseModel
 import requests
 import os
 import uuid
+import hashlib
 import shutil
-import tempfile
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 from model.embedding import get_embedding
@@ -79,7 +79,7 @@ def list_documents():
 @router.post("/ask")
 def ask(request: QuestionRequest):
     try:
-        query_vector = get_embedding(request.question)
+        query_vector = get_embedding(request.question,model="models/esti-rag-ft")
         results = client.search(
             collection_name=COLLECTION,
             query_vector=query_vector,
@@ -93,7 +93,9 @@ def ask(request: QuestionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
+def deterministic_id(text: str) -> str:
+    hash_bytes = hashlib.sha256(text.encode('utf-8')).digest()
+    return str(uuid.UUID(bytes=hash_bytes[:16]))
 @router.post("/feedback")
 def feedback(request: FeedbackRequest):
     try:
@@ -121,10 +123,11 @@ def feedback(request: FeedbackRequest):
 
         # 🔁 Réinsertion des documents dans Qdrant (réencodés)
         points = []
+
         for doc in request.positive_docs + request.negative_docs:
             embedding = model.encode(doc, normalize_embeddings=True).tolist()
             points.append(PointStruct(
-                id=str(uuid.uuid4()),
+                id=deterministic_id(doc),
                 vector=embedding,
                 payload={"text": doc}
             ))
@@ -132,7 +135,7 @@ def feedback(request: FeedbackRequest):
         client.upsert(collection_name=COLLECTION, points=points)
 
         # 🔍 Après fine-tuning
-        query_vector = get_embedding(request.question)
+        query_vector = model.encode(request.question, normalize_embeddings=True).tolist()
         after_results = client.search(
             collection_name=COLLECTION,
             query_vector=query_vector,
@@ -231,7 +234,7 @@ async def upload(file: UploadFile = File(...)):
     for chunk in  chunk_text_optimale(text):
         embedding = get_embedding(chunk)
         points.append(PointStruct(
-            id=str(uuid.uuid4()),
+            id=deterministic_id(chunk),
             vector=embedding,
             payload={"text": chunk, "source": file.filename}
         ))

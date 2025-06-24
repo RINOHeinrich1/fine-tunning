@@ -30,9 +30,11 @@ MODEL_PATH = get_latest_model_path()
 print(f"📦 Utilisation du modèle : {MODEL_PATH}")
 model = SentenceTransformer(MODEL_PATH, device=DEVICE)
 
-def get_embedding(texts):
-    model_path = get_latest_model_path()
-    print(f"🧠 Chargement SentenceTransformer depuis : {model_path}")
+def get_embedding(texts,model=""):
+    model_path=model
+    if model=="":
+        model_path = get_latest_model_path()
+        print(f"🧠 Chargement SentenceTransformer depuis : {model_path}")
     model = SentenceTransformer(model_path, device=DEVICE)
     return model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
 
