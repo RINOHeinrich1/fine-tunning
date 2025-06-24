@@ -1,14 +1,13 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException,UploadFile, File
 from .schemas import QuestionRequest, FeedbackRequest
 from model.embedder import load_model
-from model.faiss_index import build_faiss_index, search
-from model.documents import get_documents
 from model.fine_tuning import fine_tune_until_margin_respected
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, VectorParams
+from qdrant_client.models import PointStruct, VectorParams,ScrollRequest 
 from model.document_parser import extract_text
-from model.embedding import get_embedding, chunk_text_optimale
+from model.embedding import get_embedding, chunk_text_optimale,get_latest_model_path
 import numpy as np
+from sentence_transformers import SentenceTransformer
 from config import BATCH_SIZE, EPOCHS, WARMUP_STEPS, DEVICE
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -19,13 +18,10 @@ import shutil
 import tempfile
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
+from model.embedding import get_embedding
 load_dotenv()
 router = APIRouter()
 
-model = load_model()
-documents = get_documents()
-doc_embeddings = model.encode(documents, convert_to_numpy=True, normalize_embeddings=True)
-index = build_faiss_index(doc_embeddings)
 CHATBOT_RELOAD_URL = os.getenv("CHATBOT_RELOAD_URL", "http://localhost:8000/reload-model")  # À adapter selon ton infra
 
 
@@ -35,7 +31,7 @@ COLLECTION = os.getenv("COLLECTION_NAME")
 VECTOR_SIZE = int(os.getenv("VECTOR_SIZE", "384"))
 
 class DeployRequest(BaseModel):
-    version: str = "esti-rag-ft"
+    version: str = "esti-rag-ft-v7"
 
 def get_next_model_version(base_name="esti-rag-ft", models_dir="./models") -> str:
     existing_versions = []
@@ -53,44 +49,107 @@ def get_next_model_version(base_name="esti-rag-ft", models_dir="./models") -> st
 def root():
     return {"message": "✅ RAG Webservice is running."}
 
+
 @router.get("/documents")
 def list_documents():
-    return {"documents": documents}
+    try:
+        results = []
+        scroll_offset = None
+
+        while True:
+            scroll_result = client.scroll(
+                collection_name=COLLECTION,
+                scroll_filter=None,  # pas de filtre, on prend tout
+                with_payload=True,
+                limit=100,  # récupère 100 docs par itération (ajustable)
+                offset=scroll_offset
+            )
+            points, scroll_offset = scroll_result
+            results.extend([point.payload["text"] for point in points if "text" in point.payload])
+
+            if scroll_offset is None:
+                break
+
+        return {"documents": results}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/ask")
 def ask(request: QuestionRequest):
     try:
-        results, scores = search(index, model, documents, request.question, request.top_k)
+        query_vector = get_embedding(request.question)
+        results = client.search(
+            collection_name=COLLECTION,
+            query_vector=query_vector,
+            limit=request.top_k,
+            with_payload=True
+        )
         return {
             "question": request.question,
-            "results": [{"doc": d, "score": s} for d, s in zip(results, scores)]
+            "results": [{"doc": r.payload["text"], "score": r.score} for r in results]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.post("/feedback")
 def feedback(request: FeedbackRequest):
-    global model, doc_embeddings, index
-
     try:
-        before_docs, before_scores = search(index, model, documents, request.question)
-        model = fine_tune_until_margin_respected(
-            request.question, request.positive_docs, request.negative_docs,
-            model, BATCH_SIZE, EPOCHS, WARMUP_STEPS, DEVICE,30
+        # 🔍 Avant fine-tuning
+        query_vector = get_embedding(request.question)
+        before_results = client.search(
+            collection_name=COLLECTION,
+            query_vector=query_vector,
+            limit=5,
+            with_payload=True
         )
-        doc_embeddings = model.encode(documents, convert_to_numpy=True, normalize_embeddings=True)
-        index = build_faiss_index(doc_embeddings)
-        after_docs, after_scores = search(index, model, documents, request.question)
+        model = SentenceTransformer(get_latest_model_path(),device=DEVICE)
+        # 🎯 Fine-tune
+        model = fine_tune_until_margin_respected(
+            request.question,
+            request.positive_docs,
+            request.negative_docs,
+            model,
+            BATCH_SIZE,
+            EPOCHS,
+            WARMUP_STEPS,
+            DEVICE,
+            30
+        )
+
+        # 🔁 Réinsertion des documents dans Qdrant (réencodés)
+        points = []
+        for doc in request.positive_docs + request.negative_docs:
+            embedding = model.encode(doc, normalize_embeddings=True).tolist()
+            points.append(PointStruct(
+                id=str(uuid.uuid4()),
+                vector=embedding,
+                payload={"text": doc}
+            ))
+
+        client.upsert(collection_name=COLLECTION, points=points)
+
+        # 🔍 Après fine-tuning
+        query_vector = get_embedding(request.question)
+        after_results = client.search(
+            collection_name=COLLECTION,
+            query_vector=query_vector,
+            limit=5,
+            with_payload=True
+        )
 
         return {
-            "message": "✅ Fine-tuning terminé et index mis à jour.",
+            "message": "✅ Fine-tuning terminé et documents mis à jour dans Qdrant.",
             "comparison": {
-                "before": [{"doc": d, "score": s} for d, s in zip(before_docs, before_scores)],
-                "after": [{"doc": d, "score": s} for d, s in zip(after_docs, after_scores)]
+                "before": [{"doc": r.payload["text"], "score": r.score} for r in before_results],
+                "after": [{"doc": r.payload["text"], "score": r.score} for r in after_results]
             }
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/deploy")
 def deploy_model():
@@ -148,10 +207,15 @@ client = QdrantClient(
 )
 
 # Initialiser la collection
-client.recreate_collection(
+""" client.recreate_collection(
     COLLECTION,
     vectors_config=VectorParams(size=VECTOR_SIZE, distance="Cosine"),
-)
+) """
+if not client.collection_exists(COLLECTION):
+    client.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=VectorParams(size=VECTOR_SIZE, distance="Cosine"),
+    )
 
 @router.post("/upload-file")
 async def upload(file: UploadFile = File(...)):
@@ -176,7 +240,7 @@ async def upload(file: UploadFile = File(...)):
     return {"status": "ok", "chunks": len(points)}
 
 @router.get("/search-docs")
-def search(q: str):
+def searchDocs(q: str):
     vector = get_embedding(q)
     results = client.search(
         collection_name=COLLECTION,
