@@ -4,15 +4,22 @@ from model.embedder import load_model
 from model.faiss_index import build_faiss_index, search
 from model.documents import get_documents
 from model.fine_tuning import fine_tune_until_margin_respected
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct, VectorParams
+from model.document_parser import extract_text
+from model.embedding import get_embedding, chunk_text_optimale
 import numpy as np
 from config import BATCH_SIZE, EPOCHS, WARMUP_STEPS, DEVICE
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import requests
 import os
+import uuid
 import shutil
 import tempfile
 from fastapi.responses import FileResponse
+from dotenv import load_dotenv
+load_dotenv()
 router = APIRouter()
 
 model = load_model()
@@ -20,6 +27,12 @@ documents = get_documents()
 doc_embeddings = model.encode(documents, convert_to_numpy=True, normalize_embeddings=True)
 index = build_faiss_index(doc_embeddings)
 CHATBOT_RELOAD_URL = os.getenv("CHATBOT_RELOAD_URL", "http://localhost:8000/reload-model")  # À adapter selon ton infra
+
+
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+COLLECTION = os.getenv("COLLECTION_NAME")
+VECTOR_SIZE = int(os.getenv("VECTOR_SIZE", "384"))
 
 class DeployRequest(BaseModel):
     version: str = "esti-rag-ft"
@@ -127,3 +140,48 @@ def download_model(version: str):
     if not os.path.isfile(zip_path):
         raise HTTPException(status_code=404, detail="Modèle non trouvé")
     return FileResponse(path=zip_path, filename=f"{version}.zip", media_type="application/zip")
+
+
+client = QdrantClient(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY,
+)
+
+# Initialiser la collection
+client.recreate_collection(
+    COLLECTION,
+    vectors_config=VectorParams(size=VECTOR_SIZE, distance="Cosine"),
+)
+
+@router.post("/upload-file")
+async def upload(file: UploadFile = File(...)):
+    contents = await file.read()
+    filepath = f"/tmp/{file.filename}"
+    with open(filepath, "wb") as f:
+        f.write(contents)
+
+    text = extract_text(filepath)
+    os.remove(filepath)
+
+    points = []
+    for chunk in  chunk_text_optimale(text):
+        embedding = get_embedding(chunk)
+        points.append(PointStruct(
+            id=str(uuid.uuid4()),
+            vector=embedding,
+            payload={"text": chunk, "source": file.filename}
+        ))
+
+    client.upsert(collection_name=COLLECTION, points=points)
+    return {"status": "ok", "chunks": len(points)}
+
+@router.get("/search-docs")
+def search(q: str):
+    vector = get_embedding(q)
+    results = client.search(
+        collection_name=COLLECTION,
+        query_vector=vector,
+        limit=5,
+        with_payload=True
+    )
+    return [{"text": r.payload["text"], "score": r.score} for r in results]
