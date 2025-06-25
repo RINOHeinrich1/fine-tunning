@@ -1,6 +1,6 @@
-from fastapi import APIRouter, HTTPException,UploadFile, File
+from fastapi import APIRouter, HTTPException,UploadFile,Depends, File
 from .schemas import QuestionRequest, FeedbackRequest
-from model.embedder import load_model
+from middlewares.auth import get_current_user 
 from model.fine_tuning import fine_tune_until_margin_respected
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, VectorParams,ScrollRequest
@@ -51,7 +51,7 @@ def root():
 
 
 @router.get("/documents")
-def list_documents():
+def list_documents(user=Depends(get_current_user)):
     try:
         results = []
         scroll_offset = None
@@ -77,7 +77,7 @@ def list_documents():
 
 
 @router.post("/ask")
-def ask(request: QuestionRequest):
+def ask(request: QuestionRequest,user=Depends(get_current_user)):
     try:
         query_vector = get_embedding(request.question,model="models/esti-rag-ft")
         results = client.search(
@@ -97,7 +97,7 @@ def deterministic_id(text: str) -> str:
     hash_bytes = hashlib.sha256(text.encode('utf-8')).digest()
     return str(uuid.UUID(bytes=hash_bytes[:16]))
 @router.post("/feedback")
-def feedback(request: FeedbackRequest):
+def feedback(request: FeedbackRequest,user=Depends(get_current_user)):
     try:
         # 🔍 Avant fine-tuning
         query_vector = get_embedding(request.question)
@@ -155,7 +155,7 @@ def feedback(request: FeedbackRequest):
 
 
 @router.post("/deploy")
-def deploy_model():
+def deploy_model(user=Depends(get_current_user)):
     try:
         # 1. Générer une version
         version_name = get_next_model_version()
@@ -221,7 +221,7 @@ if not client.collection_exists(COLLECTION):
     )
 
 @router.post("/upload-file")
-async def upload(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...),user=Depends(get_current_user)):
     contents = await file.read()
     filepath = f"/tmp/{file.filename}"
     with open(filepath, "wb") as f:
@@ -243,7 +243,7 @@ async def upload(file: UploadFile = File(...)):
     return {"status": "ok", "chunks": len(points)}
 
 @router.get("/search-docs")
-def searchDocs(q: str):
+def searchDocs(q: str,user=Depends(get_current_user)):
     vector = get_embedding(q)
     results = client.search(
         collection_name=COLLECTION,
